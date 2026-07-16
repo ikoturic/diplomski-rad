@@ -1,0 +1,100 @@
+# =============================================================================
+# Konfiguracija za 3D CNN model – next-frame predviđanje opasnosti
+# Backbone: R(2+1)D-18 pretrained na Kinetics-400
+#
+# v15:
+#   Temelj: v13 (0.7769 AUC, novi rekord)
+#   Promjene:
+#     - freeze_layer3: false (v13=false→0.777, v14=true→0.760 → layer3 treba fine-tune)
+#     - pretrained_backbone: TAU-106K pre-trained backbone (v17)
+#       R(2+1)D-18 pre-treniran na 40k TAU prometnih uzoraka → bolja inicijalizacija
+# =============================================================================
+
+# --- Putanje do podataka (relativno od 3D CNN/ foldera) ---
+frames_root: "../../dataset/frames_224"
+viz_frames_root: "../../dataset/frames"
+metadata_dir: "../../dataset"
+annotations_dir: "../../dataset/annotations"
+yolo_detections_dir: "../yolo_detections_v26x"
+
+# --- Sekvence ---
+seq_len: 24                  # 24 frameova konteksta (2.4s @ 10fps)
+stride: 1                    # Default stride (za val/test)
+stride_safe: 12              # Hybrid: stride u sigurnoj zoni (train only)
+stride_danger: 8             # Hybrid: stride u danger/anomaly zoni
+danger_horizon: 8            # Linearna rampa: 8 frameova (0.8s) prije anomalije
+img_size: [112, 112]         # Nativna rezolucija R(2+1)D-18 (Kinetics-pretrained)
+orig_img_size: [1280, 720]   # Originalna rezolucija videa (za normalizaciju bboxova)
+
+# --- 3D CNN Model ---
+backbone_3d: r2plus1d_18     # R(2+1)D-18: factorizirane 3D konvolucije (prostorne + temporalne)
+                              # Opcije: r2plus1d_18, r3d_18, mc3_18
+hidden_dim: 256              # Dimenzija skrivenog sloja
+dropout: 0.5                 # v9 vrijednost
+freeze_3d: false             # false = fine-tune backbone djelomično
+freeze_early: true           # Zamrzni stem + layer1 + layer2
+freeze_layer3: false         # layer3 se fine-tunira (v13 pokazao: freeze_layer3=false daje 0.777 vs 0.760)
+use_grad_checkpoint: false   # RTX 5090 ima 34GB, ne treba checkpoint
+
+# --- Object Detection features ---
+use_object_branch: true      # Koristi bbox + category features
+max_objects: 15              # Maksimalan broj objekata po frameu
+bbox_feat_dim: 64            # Dimenzija numeričkih bbox feature vektora
+category_embed_dim: 16       # Dimenzija category embeddinga
+use_object_interaction: true # Self-attention između objekata u frameu
+object_interaction_heads: 4  # Broj attention glava za interakciju
+object_interaction_layers: 1 # Broj slojeva interakcije
+
+# --- Temporal Object Aggregation ---
+obj_temporal_layers: 1       # LSTM slojevi za temporalnu agregaciju objekata
+obj_temporal_dropout: 0.0    # Dropout za LSTM (koristi se samo ako layers > 1)
+attention_heads: 4           # Broj attention glava za temporalnu attention
+use_causal_attention: true   # Kauzalna attention (ne gleda budućnost)
+
+# --- Optical Flow (opcionalno – 3D CNN već modelira motion) ---
+use_optical_flow: false      # Isključeno – 3D CNN inherentno modelira kretanje
+optical_flow_dir: "../flow_hd"
+use_global_flow: false
+flow_feat_dim: 128
+
+# --- Focal Loss ---
+use_focal_loss: true
+focal_gamma: 1.0
+focal_alpha: 0.6
+label_smoothing: 0.05
+
+# --- Temporal Auxiliary Loss ---
+# 3D CNN layer4 → T'=3 temporalne rezine (svaka ≈ 8 frameova)
+# temporal_head predviđa max-danger po segmentu → 3× više nadzornog signala
+use_temporal_aux: true
+temporal_aux_weight: 0.3     # total_loss = main_loss + 0.3 * aux_loss
+
+# --- Anti-overfitting (v9 uvjeti) ---
+mixup_alpha: 0.3             # v22: interpolacija uzoraka
+ema_decay: 0.0
+ema_start_epoch: 2
+
+# --- Trening ---
+num_epochs: 15               # v9 vrijednost
+batch_size: 32               # RTX 5090
+val_batch_size: 32           # Windows paging file limit
+gradient_accumulation_steps: 2  # efektivni batch = 32 * 2 = 64
+learning_rate: 0.00005
+cnn_lr_factor: 0.1
+weight_decay: 0.05           # v22: pojačana regularizacija
+early_stopping_patience: 7
+num_workers: 4               # Windows shared memory limit
+val_num_workers: 2
+persistent_workers: true
+prefetch_factor: 2
+warmup_epochs: 2
+
+# --- SWA ---
+swa_start_epoch: 0           # Isključeno
+
+# --- Cosine scheduler ---
+cosine_T0: 10                # v9 vrijednost
+cosine_T_mult: 2
+
+# --- TAU pre-trained backbone (v19) ---
+pretrained_backbone: "checkpoints_3d/v19/tau_pretrain_backbone.pt"

@@ -1,0 +1,114 @@
+# =============================================================================
+# Konfiguracija za CNN+LSTM+BBox model – next-frame predviđanje opasnosti
+# v27: ResNet18 + TAU-106K pretreniran backbone (vs v25 koji ima ImageNet init)
+#      Jedina razlika od v25: pretrained_backbone → backbone inicijaliziran
+#      težinama naučenim na TAU-106K (9000+ prometnih klipova) umjesto ImageNet
+# =============================================================================
+
+# --- Putanje do podataka ---
+frames_root: "../dataset/frames_224"
+viz_frames_root: "../dataset/frames"   # Originalna rezolucija za vizualizaciju (1280x720)
+metadata_dir: "../dataset"
+annotations_dir: "../dataset/annotations"   # DoTA anotacije (fallback)
+yolo_detections_dir: "yolo_detections_v26x"       # YOLO detekcije (prioritet ako postoji)
+
+# --- Sekvence ---
+seq_len: 24                  # 24 frameova konteksta (2.4s @ 10fps) — v14 dokazano
+stride: 1                    # Default stride (za val/test)
+stride_safe: 12              # Hybrid: stride u sigurnoj zoni (train only)
+stride_danger: 8              # Hybrid: stride u danger/anomaly zoni — 67% overlap, ~50/50 balans
+danger_horizon: 8            # Linearna rampa: 8 frameova (0.8s) prije anomalije
+img_size: [224, 224]         # ResNet18 nativna rezolucija (pretreniran na 224)
+orig_img_size: [1280, 720]   # Originalna rezolucija videa (za normalizaciju bboxova)
+
+# --- Model ---
+backbone: resnet18            # ResNet18: identično v25 (kontrolirana usporedba)
+hidden_dim: 256
+lstm_layers: 2
+dropout: 0.5
+lstm_dropout: 0.3
+freeze_cnn: true             # Zamrzni backbone (isti uvjet kao v25 — čista usporedba init)
+unfreeze_layer3: false
+unfreeze_layer4: false
+cnn_lr_factor: 0.1
+use_attention: true
+attention_heads: 4
+bidirectional: false
+use_causal_attention: true
+
+# --- TAU-106K pretreniran backbone ---
+pretrained_backbone: "checkpoints/tau_pretrain_2d/tau_pretrain_backbone.pt"
+
+# --- Object Detection features ---
+max_objects: 15
+roi_output_size: 3
+roi_feat_dim: 128
+bbox_feat_dim: 64
+category_embed_dim: 16
+
+# --- Optical Flow ---
+use_optical_flow: true
+optical_flow_dir: "flow_hd"
+use_global_flow: true
+flow_feat_dim: 128
+
+# --- Per-Object Flow ---
+use_per_object_flow: false
+obj_flow_pool_size: 5
+obj_flow_feat_dim: 128
+
+# --- Object Interaction ---
+use_object_interaction: true
+object_interaction_heads: 4
+object_interaction_layers: 1
+
+# --- Focal Loss ---
+use_focal_loss: true
+focal_gamma: 1.0
+focal_alpha: 0.6
+label_smoothing: 0.05
+
+# --- Trening ---
+num_epochs: 20
+batch_size: 96
+val_batch_size: 128
+gradient_accumulation_steps: 1
+learning_rate: 0.00022
+weight_decay: 0.02
+early_stopping_patience: 5
+num_workers: 4
+val_num_workers: 0           # Windows: izbjegni shared memory crash (pin_memory + workers)
+persistent_workers: true
+prefetch_factor: 4
+
+# --- SWA ---
+swa_start_epoch: 0
+swa_lr: 0.00015
+
+# --- Mixup ---
+mixup_alpha: 0.2
+
+# --- Cosine Annealing Scheduler ---
+cosine_T0: 20
+cosine_T_mult: 1
+warmup_epochs: 2
+
+# --- Checkpoint ---
+checkpoint_dir: "checkpoints"
+save_every: 5
+
+# --- Multi-timestep auxiliary loss ---
+aux_loss_weight: 0.0
+
+# --- EMA ---
+ema_decay: 0.0
+ema_start_epoch: 999
+
+# --- CNN Cache (pre-extracted features) ---
+# Putanja do pre-extracted CNN features (python extract_cnn_features.py)
+# null = učitavaj slike i pokreni CNN svaki put (standardno)
+cnn_cache_dir: cnn_cache_convnext_224
+
+# --- Anti-overfitting ---
+epoch_subsample: 1.0         # Koristi sve uzorke
+temporal_mask_prob: 0.15     # 15% temporal augmentacija (v14 baza)

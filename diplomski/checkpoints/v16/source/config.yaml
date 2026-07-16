@@ -1,0 +1,94 @@
+# =============================================================================
+# Konfiguracija za CNN+LSTM+BBox model – next-frame predviđanje opasnosti
+# v16: Per-object flow (128-dim), bez globalnog FlowEncoder-a, binarni labeli
+# =============================================================================
+
+# --- Putanje do podataka ---
+frames_root: "../dataset/frames_224"
+viz_frames_root: "../dataset/frames"   # Originalna rezolucija za vizualizaciju (1280x720)
+metadata_dir: "../dataset"
+annotations_dir: "../dataset/annotations"   # DoTA anotacije (fallback)
+yolo_detections_dir: "yolo_detections_v26x"       # YOLO detekcije (prioritet ako postoji)
+
+# --- Sekvence ---
+seq_len: 24                  # 24 frameova konteksta (2.4s @ 10fps)
+stride: 1                    # Default stride (za val/test)
+stride_safe: 12              # Hybrid: stride u sigurnoj zoni (train only)
+stride_danger: 8             # Hybrid: stride u danger/anomaly zoni — 67% overlap, ~50/50 balans
+danger_horizon: 0            # Binarni labeli: 0=sigurno, 1=anomalija (bez rampe)
+img_size: [224, 224]         # ResNet nativna rezolucija
+orig_img_size: [1280, 720]   # Originalna rezolucija videa (za normalizaciju bboxova)
+
+# --- Model ---
+backbone: resnet18            # ResNet18: manji kapacitet → manje overfittinga
+hidden_dim: 256              # Povećan kapacitet — v7 dokazao mali gap (0.01)
+lstm_layers: 2               # 2 LSTM sloja za veći temporalni kapacitet
+dropout: 0.5                 # Dropout za projekcijske slojeve
+lstm_dropout: 0.3            # Recurrent dropout na LSTM outputu
+freeze_cnn: true             # Zamrzni SVE CNN slojeve
+unfreeze_layer3: false       # Layer3 zamrznut (nema fine-tune)
+unfreeze_layer4: false        # Layer4 zamrznut (v15 pokazao da ne pomaže)
+cnn_lr_factor: 0.1           # Neaktivno kad je layer4 zamrznut
+use_attention: true          # Temporal multi-head self-attention
+attention_heads: 4           # 256 / 4 = 64 dim po glavi
+
+# --- Object Detection features ---
+max_objects: 15              # Maksimalan broj objekata po frameu
+roi_output_size: 3           # ROI Align output: 3x3
+roi_feat_dim: 128            # Dimenzija ROI feature vektora
+bbox_feat_dim: 64            # Dimenzija numeričkih bbox feature vektora
+category_embed_dim: 16       # Dimenzija category embeddinga
+
+# --- Optical Flow ---
+use_optical_flow: true       # Učitaj flow mape s diska (potrebno za per-object i globalni)
+optical_flow_dir: "flow_hd"  # Direktorij s pre-izračunatim RAFT flow-om
+use_global_flow: false       # Bez globalnog FlowEncoder CNN-a (zamijenjeno per-object flow)
+flow_feat_dim: 128           # Dimenzija globalnog flow feature vektora (neaktivno)
+
+# --- Per-Object Flow ---
+use_per_object_flow: true    # Crop residual flow per object bbox → encoder → 128-dim
+obj_flow_pool_size: 5        # AdaptiveAvgPool2d na (5×5) po objektu
+obj_flow_feat_dim: 128       # Dimenzija per-object flow feature vektora
+
+# --- Object Interaction ---
+use_object_interaction: true  # Self-attention između objekata u frameu (v13)
+object_interaction_heads: 4   # Broj attention glava (320/4 = 80 dim po glavi)
+object_interaction_layers: 1  # Broj transformer slojeva za interakciju
+
+# --- Focal Loss ---
+use_focal_loss: true         # Focal Loss za neuravnoteženi dataset
+focal_gamma: 1.0             # Focal gamma
+focal_alpha: 0.6             # Focal alpha
+label_smoothing: 0.05         # Jače sprječavanje overconfidence
+
+# --- Trening ---
+num_epochs: 20               # Više epoha (SWA treba duži trening)
+batch_size: 112              # RTX 5090 32GB: frozen CNN + per-obj flow (manji od layer4 unfrozen)
+val_batch_size: 128          # Val bs smanjen — obj_flow tensori troše extra VRAM (160 OOM)
+gradient_accumulation_steps: 1  # Bez akumulacije — puni batch stane u VRAM
+learning_rate: 0.00022       # AdamW base LR
+weight_decay: 0.02           # L2 regularizacija
+early_stopping_patience: 5    # Brže zaustavi
+num_workers: 4               # 4 workera za paralelno učitavanje
+persistent_workers: false    # Ubij workere između epoha (izbjegava Windows Error 1455)
+prefetch_factor: 2
+
+# --- SWA (Stochastic Weight Averaging) ---
+swa_start_epoch: 0           # 0 = disabled (uzrokovao nestabilnost val lossa u v7)
+swa_lr: 0.00015              # SWA learning rate (neaktivno dok je start=0)
+
+# --- Mixup ---
+mixup_alpha: 0.2             # Beta distribucija za mixup (jače miješanje)
+
+# --- Cosine Annealing Scheduler ---
+cosine_T0: 20                # Jedan gladak cosine pad bez restarta
+cosine_T_mult: 1             # Bez restarta
+warmup_epochs: 2             # Warmup: 2 epohe linearni ramp-up
+
+# --- Checkpoint ---
+checkpoint_dir: "checkpoints"
+save_every: 5                # Spremi checkpoint svakih N epoha
+
+# --- Anti-overfitting ---
+epoch_subsample: 1.0         # Koristi sve uzorke
+temporal_mask_prob: 0.15     # 15% temporal augmentacija

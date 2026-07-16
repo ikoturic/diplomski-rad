@@ -1,0 +1,102 @@
+# =============================================================================
+# Konfiguracija za 3D CNN model – next-frame predviđanje opasnosti
+# Backbone: R(2+1)D-18 pretrained na Kinetics-400
+#
+# v5: identičan v4 configu, ali u train_3d.py je popravljen mixup_batch():
+#     v4 je linearno mixao bbox_features (pozicije/brzine objekata) između
+#     dva uzorka, dok je categories i obj_mask uzimao samo iz A. Set-podaci
+#     se ne mogu linearno interpolirati → objektna grana je dobivala
+#     besmislen signal (val AUC v4 platoirao na 0.717 od ep2).
+#     v5 mixup mixa SAMO frames + target (+ flow, per_frame_targets);
+#     object branch ostaje cijeli iz uzorka A (lam ≥ 0.5).
+# =============================================================================
+
+# --- Putanje do podataka (relativno od 3D CNN/ foldera) ---
+frames_root: "../../dataset/frames_224"
+viz_frames_root: "../../dataset/frames"
+metadata_dir: "../../dataset"
+annotations_dir: "../../dataset/annotations"
+yolo_detections_dir: "../yolo_detections_v26x"
+
+# --- Sekvence ---
+seq_len: 24                  # 24 frameova konteksta (2.4s @ 10fps)
+stride: 1                    # Default stride (za val/test)
+stride_safe: 24              # v8: stride experiment — non-overlapping clips (manje samples, manje overfit)
+stride_danger: 24            # v8: stride experiment — non-overlapping clips
+danger_horizon: 8            # Linearna rampa: 8 frameova (0.8s) prije anomalije
+img_size: [112, 112]         # 112×112 – nativna rezolucija Kinetics-pretrained 3D modela
+orig_img_size: [1280, 720]   # Originalna rezolucija videa (za normalizaciju bboxova)
+
+# --- 3D CNN Model ---
+backbone_3d: r2plus1d_18     # R(2+1)D-18: factorizirane 3D konvolucije (prostorne + temporalne)
+                              # Opcije: r2plus1d_18, r3d_18, mc3_18
+hidden_dim: 256              # Dimenzija skrivenog sloja
+dropout: 0.5                 # v4: vraćeno na 0.5 (v3: 0.6 je previše u kombinaciji s mixup+EMA)
+freeze_3d: false             # false = fine-tune layer3+layer4 (freeze_early=true)
+freeze_early: true           # Zamrzni stem + layer1 + layer2
+use_grad_checkpoint: true    # Gradient checkpointing za uštedu VRAM-a
+
+# --- Object Detection features ---
+use_object_branch: true      # v8: vraćeno (v7 ablation pokazao da 3D CNN sam radi 0.72;
+                              # object branch nije dominirao u v6 — guši ga regularizacija)
+max_objects: 15              # Maksimalan broj objekata po frameu
+bbox_feat_dim: 64            # Dimenzija numeričkih bbox feature vektora
+category_embed_dim: 16       # Dimenzija category embeddinga
+use_object_interaction: true # Self-attention između objekata u frameu
+object_interaction_heads: 4  # Broj attention glava za interakciju
+object_interaction_layers: 1 # Broj slojeva interakcije
+
+# --- Temporal Object Aggregation ---
+obj_temporal_layers: 1       # LSTM slojevi za temporalnu agregaciju objekata
+obj_temporal_dropout: 0.0    # Dropout za LSTM (koristi se samo ako layers > 1)
+attention_heads: 4           # Broj attention glava za temporalnu attention
+use_causal_attention: true   # Kauzalna attention (ne gleda budućnost)
+
+# --- Optical Flow (opcionalno – 3D CNN već modelira motion) ---
+use_optical_flow: false      # Isključeno – 3D CNN inherentno modelira kretanje
+optical_flow_dir: "../flow_hd"
+use_global_flow: false
+flow_feat_dim: 128
+
+# --- Focal Loss ---
+use_focal_loss: true
+focal_gamma: 1.0
+focal_alpha: 0.6
+label_smoothing: 0.05
+
+# --- Anti-overfitting ---
+mixup_alpha: 0.2             # v3+: zadržano — interpolacija RGB+bbox+target
+temporal_mask_prob: 0.0      # v4: isključeno (v3: 0.15 — zbunjuje 3D CNN koji očekuje uzastopne framea)
+ema_decay: 0.998             # v4: ↓ od 0.999 — blaže glađenje za samo 12-15 epoha
+ema_start_epoch: 2           # Pokreni EMA nakon prve epohe
+
+# --- v6: Geometrijske/temporalne augmentacije (anti-overfit val plateau) ---
+# v5: val AUC zaglavljen na ~0.72 od epohe 2 dok train AUC raste do 0.85+.
+# Hflip + ColorJitter + RandomErasing nisu dovoljni — dodajemo:
+#   1) random resized crop s konzistentnim bbox transformom kroz svih 24 framea
+#   2) temporal jitter — random offset start/target prozora
+random_crop_prob: 0.5        # 0 = isključeno; 0.5 = svaki drugi klip dobiva crop
+random_crop_scale: [0.85, 1.0]  # min-max skala (0.85 = max ~15% crop sa svake strane)
+temporal_jitter: 2           # ±2 framea offset prozora (±0.2s @ 10fps)
+
+# --- Trening ---
+num_epochs: 25               # v8: ↑ jer stride=24 daje ~4× manje samples po epohi
+batch_size: 16               # Manji batch – 3D CNN troši više VRAM-a
+val_batch_size: 64           # Veći za validaciju (mikro-batching unutar validate())
+gradient_accumulation_steps: 4  # Efektivni batch = 16 * 4 = 64
+learning_rate: 0.0001        # Manji LR za fine-tuning
+cnn_lr_factor: 0.1           # v4: vraćeno na 0.1 (v3: 0.05 je previše zakočilo backbone)
+weight_decay: 0.02           # v4: vraćeno na 0.02 (v3: 0.05 je previše u kombinaciji s ostalim)
+early_stopping_patience: 5   # v4: ↑ od 4 — EMA treba malo prostora
+num_workers: 4
+val_num_workers: 2           # v3: ↓ od 4 — Windows shared memory crash u 5. epohi (val_batch=64 × 24 framea = 230 MB/batch)
+persistent_workers: true
+prefetch_factor: 2           # v3: ↓ od 4 — manje batcheva u letu = manje shared memory pritiska
+warmup_epochs: 2             # Warmup za stabilno fine-tuning
+
+# --- SWA ---
+swa_start_epoch: 0           # 0 = disabled
+
+# --- Cosine scheduler ---
+cosine_T0: 15                # v4: poravnano s num_epochs=15 — jedan glatki cosine pad
+cosine_T_mult: 1             # bez restarta

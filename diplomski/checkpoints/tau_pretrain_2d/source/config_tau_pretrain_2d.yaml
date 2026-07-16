@@ -1,0 +1,105 @@
+# =============================================================================
+# Konfiguracija za TAU-106K pre-trening 2D CNN+LSTM+BBox modela
+#
+# Cilj: pre-trenirati ResNet18 backbone (+ objektni/LSTM head) na TAU-106K
+#   klipovima → backbone nauči generalne prometne uzorke → fine-tune na DoTA
+#
+# Analogno 3D CNN pre-treniranju (config_tau_pretrain.yaml / 3D CNN/v19):
+#   - isti dataset (tau106k_pretrain)
+#   - freeze_cnn: false → treniramo cijeli backbone od ImageNet inicijalizacije
+#   - save_backbone_only: true → spremi cnn_early/layer3/layer4 za transfer
+#
+# Nakon završetka, dodaj u config.yaml za v27:
+#   pretrained_backbone: "checkpoints/tau_pretrain_2d/tau_pretrain_backbone.pt"
+# =============================================================================
+
+# --- Putanje (relativno od diplomski/ foldera) ---
+frames_root: "../tau106k_eval/frames_224"
+metadata_dir: "../tau106k_pretrain"
+annotations_dir: "../tau106k_pretrain/annotations"
+yolo_detections_dir: "../tau106k_eval/yolo_detections_tau"
+
+# --- Sekvence ---
+seq_len: 24
+stride: 1
+stride_safe: 10              # Manji stride – više normalnih scena u TAU
+stride_danger: 5
+danger_horizon: 8
+no_ramp: true                # TAU anotacije su binarne (nema rampe)
+img_size: [224, 224]         # ResNet18 nativna rezolucija
+orig_img_size: [1280, 720]
+
+# --- 2D Model (identična arhitektura kao v25) ---
+backbone: resnet18
+hidden_dim: 256
+lstm_layers: 2
+dropout: 0.3                 # Manji dropout – pretrening na velikom skupu
+lstm_dropout: 0.1
+freeze_cnn: false            # Pretrening: treniramo CIJELI backbone
+unfreeze_layer3: false       # Ignorira se kad je freeze_cnn: false
+unfreeze_layer4: false       # Ignorira se kad je freeze_cnn: false
+cnn_lr_factor: 0.5           # CNN dobiva 0.5× base LR (oprezniji fine-tune ImageNet težina)
+use_attention: true
+attention_heads: 4
+bidirectional: false
+use_causal_attention: true
+
+# --- Object Detection ---
+max_objects: 15
+roi_output_size: 3
+roi_feat_dim: 128
+bbox_feat_dim: 64
+category_embed_dim: 16
+
+# --- Optical Flow (isključeno za pretrening – smanjuje kompleksnost) ---
+use_optical_flow: false
+use_global_flow: false
+flow_feat_dim: 128
+use_per_object_flow: false
+obj_flow_pool_size: 5
+obj_flow_feat_dim: 128
+
+# --- Object Interaction ---
+use_object_interaction: true
+object_interaction_heads: 4
+object_interaction_layers: 1
+
+# --- Focal Loss ---
+use_focal_loss: true
+focal_gamma: 1.0
+focal_alpha: 0.6
+label_smoothing: 0.02        # Manji label smoothing za pretrening
+
+# --- Anti-overfitting ---
+mixup_alpha: 0.0             # Isključeno za pretrening
+aux_loss_weight: 0.0         # Isključeno
+ema_decay: 0.0
+ema_start_epoch: 999
+
+# --- Trening ---
+num_epochs: 10               # Kraće – domain adaptation, ne overfit
+batch_size: 96
+val_batch_size: 128
+gradient_accumulation_steps: 1
+learning_rate: 0.0002        # Veći LR za pretrening (backbone nije zamrznut)
+weight_decay: 0.01
+early_stopping_patience: 5
+num_workers: 4
+val_num_workers: 0           # Windows: izbjegni ERROR_COMMITMENT_LIMIT (shared memory crash)
+val_stride: 2                # stride za val set (stride=1 daje 436K uzoraka → 10h validacija)
+persistent_workers: true
+prefetch_factor: 4
+warmup_epochs: 1
+
+# --- Cosine Annealing ---
+cosine_T0: 10
+cosine_T_mult: 1
+
+# --- SWA (isključeno) ---
+swa_start_epoch: 0
+swa_lr: 0.0001
+
+# --- Checkpoint ---
+checkpoint_dir: "checkpoints/tau_pretrain_2d"
+save_every: 5
+save_backbone_only: true     # Spremi backbone state_dict za transfer na DoTA

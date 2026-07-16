@@ -1,0 +1,78 @@
+# =============================================================================
+# Konfiguracija za 3D CNN model – next-frame predviđanje opasnosti
+# Backbone: R(2+1)D-18 pretrained na Kinetics-400
+# =============================================================================
+
+# --- Putanje do podataka (relativno od 3D CNN/ foldera) ---
+frames_root: "../../dataset/frames_224"
+viz_frames_root: "../../dataset/frames"
+metadata_dir: "../../dataset"
+annotations_dir: "../../dataset/annotations"
+yolo_detections_dir: "../yolo_detections_v26x"
+
+# --- Sekvence ---
+seq_len: 24                  # 24 frameova konteksta (2.4s @ 10fps)
+stride: 1                    # Default stride (za val/test)
+stride_safe: 12              # Hybrid: stride u sigurnoj zoni (train only)
+stride_danger: 8             # Hybrid: stride u danger/anomaly zoni
+danger_horizon: 8            # Linearna rampa: 8 frameova (0.8s) prije anomalije
+img_size: [112, 112]         # 112×112 – nativna rezolucija Kinetics-pretrained 3D modela
+orig_img_size: [1280, 720]   # Originalna rezolucija videa (za normalizaciju bboxova)
+
+# --- 3D CNN Model ---
+backbone_3d: r2plus1d_18     # R(2+1)D-18: factorizirane 3D konvolucije (prostorne + temporalne)
+                              # Opcije: r2plus1d_18, r3d_18, mc3_18
+hidden_dim: 256              # Dimenzija skrivenog sloja
+dropout: 0.5                 # Dropout za projekcijske slojeve
+freeze_3d: false             # false = fine-tune layer3+layer4 (freeze_early=true)
+freeze_early: true           # Zamrzni stem + layer1 + layer2
+use_grad_checkpoint: true    # Gradient checkpointing za uštedu VRAM-a
+
+# --- Object Detection features ---
+use_object_branch: true      # Koristi bbox + category features
+max_objects: 15              # Maksimalan broj objekata po frameu
+bbox_feat_dim: 64            # Dimenzija numeričkih bbox feature vektora
+category_embed_dim: 16       # Dimenzija category embeddinga
+use_object_interaction: true # Self-attention između objekata u frameu
+object_interaction_heads: 4  # Broj attention glava za interakciju
+object_interaction_layers: 1 # Broj slojeva interakcije
+
+# --- Temporal Object Aggregation ---
+obj_temporal_layers: 1       # LSTM slojevi za temporalnu agregaciju objekata
+obj_temporal_dropout: 0.0    # Dropout za LSTM (koristi se samo ako layers > 1)
+attention_heads: 4           # Broj attention glava za temporalnu attention
+use_causal_attention: true   # Kauzalna attention (ne gleda budućnost)
+
+# --- Optical Flow (opcionalno – 3D CNN već modelira motion) ---
+use_optical_flow: false      # Isključeno – 3D CNN inherentno modelira kretanje
+optical_flow_dir: "../flow_hd"
+use_global_flow: false
+flow_feat_dim: 128
+
+# --- Focal Loss ---
+use_focal_loss: true
+focal_gamma: 1.0
+focal_alpha: 0.6
+label_smoothing: 0.05
+
+# --- Trening ---
+num_epochs: 25               # Više epoha jer fine-tunamo backbone
+batch_size: 16               # Manji batch – 3D CNN troši više VRAM-a
+val_batch_size: 32           # Veći za validaciju (nema backward)
+gradient_accumulation_steps: 4  # Efektivni batch = 16 * 4 = 64
+learning_rate: 0.0001        # Manji LR za fine-tuning
+cnn_lr_factor: 0.1           # 3D backbone LR = base_lr * 0.1
+weight_decay: 0.02
+early_stopping_patience: 7
+num_workers: 4
+val_num_workers: 4
+persistent_workers: true
+prefetch_factor: 4
+warmup_epochs: 2             # Warmup za stabilno fine-tuning
+
+# --- SWA ---
+swa_start_epoch: 0           # 0 = disabled
+
+# --- Cosine scheduler ---
+cosine_T0: 10
+cosine_T_mult: 2

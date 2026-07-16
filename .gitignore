@@ -1,0 +1,82 @@
+# =============================================================================
+# .gitignore za projekt detekcije prometnih anomalija
+# =============================================================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb
+
+# --- Frameovi i videozapisi (preveliki za GitHub) ---
+dataset/frames/
+dataset/frames_224/
+dataset/external_negatives/
+TABot/
+RTRK/
+
+# --- Cijeli TAU i CarCrash direktoriji (dataset, nije izvorni kod) ---
+tau106k_eval/
+tau106k_pretrain/
+diplomski/CarCrash/
+
+# --- Optički tok (23 GB) ---
+diplomski/flow_hd/
+diplomski/flow_tau106k/
+
+# --- CNN cache (14 GB) ---
+diplomski/cnn_cache_tau106k_resnet18/
+
+# --- YOLO detekcije ---
+diplomski/yolo_detections_v26x/
+
+# --- Model checkpointi (.pth) ---
+# Source code snapshotovi (source/) su uključeni, samo binarni modeli su isključeni
+diplomski/checkpoints/**/*.pth
+diplomski/checkpoints/**/*.pt
+diplomski/3D CNN/checkpoints_3d/**/*.pth
+diplomski/3D CNN/checkpoints_3d/**/*.pt
+diplomski/checkpoints/tau_pretrain_2d/*.pth
+
+# YOLO weights
+diplomski/yolo26x.pt
+
+# --- Cached predikcije ---
+**/*.pkl
+
+# --- OSJETLJIVI PODACI - NE UPLOADATI! ---
+cookies.txt
+*.cookies
+.env
+secrets.*
+
+# --- Dataset anotacije ---
+dataset/annotations/
+
+# --- Generirani grafovi (opcijalno, mogu ostati) ---
+# Otkomenirati ako ne želiš grafove u repozitoriju:
+# **/*.png
+# checkpoints/**/*.png
+
+# --- IDE i OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# --- Log fajlovi ---
+*.log

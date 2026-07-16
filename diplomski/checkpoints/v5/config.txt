@@ -1,0 +1,84 @@
+seq len 24, resnet frozen, flow, 
+# =============================================================================
+# Konfiguracija za CNN+LSTM+BBox model – next-frame predviđanje opasnosti
+# v15: ResNet50 FROZEN + anti-overfit combo (SWA, Mixup, LSTM dropout)
+# =============================================================================
+
+# --- Putanje do podataka ---
+frames_root: "../dataset/frames_224"
+viz_frames_root: "../dataset/frames"   # Originalna rezolucija za vizualizaciju (1280x720)
+metadata_dir: "../dataset"
+annotations_dir: "../dataset/annotations"   # DoTA anotacije (fallback)
+yolo_detections_dir: "yolo_detections_v26x"       # YOLO detekcije (prioritet ako postoji)
+
+# --- Sekvence ---
+seq_len: 24                  # 24 frameova konteksta (2.4s @ 10fps)
+stride: 1                    # Default stride (za val/test)
+stride_safe: 8               # Hybrid: stride u sigurnoj zoni (train only)
+stride_danger: 2             # Hybrid: stride u danger/anomaly zoni (train only)
+danger_horizon: 8            # Rampa opasnosti: 8 frameova prije anomaly_start (0.8s)
+img_size: [224, 224]         # ResNet nativna rezolucija
+orig_img_size: [1280, 720]   # Originalna rezolucija videa (za normalizaciju bboxova)
+
+# --- Model ---
+backbone: resnet18            # ResNet18: manji kapacitet → manje overfittinga
+hidden_dim: 192              # Smanjen kapacitet → manje overfittinga
+lstm_layers: 1               # Jedan LSTM sloj
+dropout: 0.5                 # Dropout za projekcijske slojeve
+lstm_dropout: 0.3            # Recurrent dropout na LSTM outputu
+freeze_cnn: true             # Zamrzni SVE CNN slojeve
+unfreeze_layer3: false       # Layer3 zamrznut (nema fine-tune)
+unfreeze_layer4: false       # Layer4 zamrznut (nema fine-tune)
+use_attention: true          # Temporal multi-head self-attention
+attention_heads: 4           # 192 / 4 = 48 dim po glavi
+
+# --- Object Detection features ---
+max_objects: 15              # Maksimalan broj objekata po frameu
+roi_output_size: 3           # ROI Align output: 3x3
+roi_feat_dim: 128            # Dimenzija ROI feature vektora
+bbox_feat_dim: 64            # Dimenzija numeričkih bbox feature vektora
+category_embed_dim: 16       # Dimenzija category embeddinga
+
+# --- Optical Flow ---
+use_optical_flow: true      # Postavi na true nakon compute_flow.py
+optical_flow_dir: "flow_224" # Direktorij s pre-izračunatim RAFT flow-om
+flow_feat_dim: 128           # Dimenzija flow feature vektora
+
+# --- Focal Loss ---
+use_focal_loss: true         # Focal Loss za neuravnoteženi dataset
+focal_gamma: 1.0             # Focal gamma
+focal_alpha: 0.6             # Focal alpha
+label_smoothing: 0.05         # Jače sprječavanje overconfidence
+
+# --- Trening ---
+num_epochs: 20               # Više epoha (SWA treba duži trening)
+batch_size: 96               # RTX 5090 32GB VRAM — CNN frozen, stane puno više
+gradient_accumulation_steps: 1  # Efektivni batch = 96 (dovoljno VRAM-a bez akumulacije)
+learning_rate: 0.0003        # Sporiji LR — više epoha do overfita
+weight_decay: 0.02           # L2 regularizacija
+early_stopping_patience: 5    # Brže zaustavi
+
+# --- SWA (Stochastic Weight Averaging) ---
+swa_start_epoch: 8           # SWA kreće od epohe 8 (ranije prosječenje)
+swa_lr: 0.00015              # SWA learning rate (50% od base LR)
+
+# --- Mixup ---
+mixup_alpha: 0.2             # Beta distribucija za mixup (jače miješanje)
+
+# --- Cosine Annealing Scheduler ---
+cosine_T0: 8                 # Period do SWA starta
+cosine_T_mult: 2             # Multiplikator perioda
+
+# --- Checkpoint ---
+checkpoint_dir: "checkpoints"
+save_every: 5                # Spremi checkpoint svakih N epoha
+
+# --- Anti-overfitting ---
+epoch_subsample: 1.0         # Koristi sve uzorke
+temporal_mask_prob: 0.15     # 15% temporal augmentacija
+
+# --- DataLoader ---
+num_workers: 4               # 4 workera — Windows shared memory limit s većim batch-om
+persistent_workers: true     # Drži workere živima
+prefetch_factor: 4           # Agresivniji prefetch za brže punjenje GPU pipeline-a
+pin_memory: true             # Brži transfer CPU→GPU
