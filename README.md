@@ -95,3 +95,9 @@ Typical workflow:
 ## Related literature
 
 The [related_work](related_work/) folder contains the research papers and scientific references used to support the thesis and to contextualize the proposed traffic-danger detection approach.
+
+## Contact
+
+**Ivan Koturić**  
+Email: [ikoturic84@gmail.com](mailto:ikoturic84@gmail.com)  
+GitLab: [ikoturic](https://gitlab.com/ivan.koturic)
