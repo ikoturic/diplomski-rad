@@ -70,7 +70,7 @@ The better-performing configuration in the thesis is the 3D model, which achieve
 
 The repository contains evaluation and training plots that are useful for the thesis presentation and documentation.
 
-![3D CNN ROC curve](implementation/3D%20CNN/checkpoints_3d/v24/evaluacija_DoTA/roc_curve.png)
+<img src="implementation/3D%20CNN/checkpoints_3d/v24/evaluacija_DoTA/roc_curve.png" alt="3D CNN ROC curve" width="500" />
 
 ![3D CNN training curves](implementation/3D%20CNN/checkpoints_3d/v24/training_curves.png)
 
