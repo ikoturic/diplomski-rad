@@ -36,21 +36,7 @@ import torch.nn.functional as F
 import torchvision.models.video as video_models
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-# Import FlowEncoder iz parent modula ako treba
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-
-# Kategorije objekata u DoTA anotacijama
-CATEGORY_MAP = {
-    "car": 1,
-    "truck": 2,
-    "bus": 3,
-    "person": 4,
-    "rider": 5,
-    "bike": 6,
-    "motor": 7,
-}
-NUM_CATEGORIES = len(CATEGORY_MAP)  # 7
+from utils import NUM_CATEGORIES
 
 
 # ========================================================================= #

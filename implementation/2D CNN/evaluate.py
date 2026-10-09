@@ -1,20 +1,10 @@
-"""
-Evaluacija bez rampe — čisto binarni GT labeli.
-
-GT = 1 za frameove u [anomaly_start, anomaly_end], inače GT = 0.
-Delay analiza mjeri kašnjenje od anomaly_start (ne od 50% rampe).
-
-Pokretanje:
-    python evaluate_no_ramp.py --checkpoint checkpoints/v25/best_model.pth
-    python evaluate_no_ramp.py --checkpoint checkpoints/v25/best_model.pth --threshold 0.4
-"""
-
 import os
 import json
 import pickle
 import argparse
 import hashlib
 from collections import defaultdict
+from typing import Dict, List, Tuple
 
 import yaml
 import numpy as np
@@ -25,62 +15,19 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import (
     roc_auc_score, average_precision_score,
     precision_recall_curve, roc_curve,
-    precision_score, recall_score, f1_score,
-    accuracy_score, confusion_matrix,
 )
-from scipy.ndimage import median_filter as scipy_median_filter
 from tqdm import tqdm
 
 from model import CNN_LSTM_BBox
 from dataloader import create_test_dataloader
-
-
-# ========================================================================= #
-#  Post-processing                                                            #
-# ========================================================================= #
-
-POSTPROCESS_CHOICES = [
-    "none",
-    "ma3", "ma5", "ma7", "ma9",
-    "median3", "median5", "median7", "median11",
-]
-
-def apply_postprocess(video_probs, method):
-    """Primijeni post-processing na svaki video."""
-    if method == "none":
-        return video_probs
-
-    result = {}
-    for vn, frame_probs in video_probs.items():
-        sorted_fp = sorted(frame_probs, key=lambda x: x[0])
-        frames = [f[0] for f in sorted_fp]
-        probs = np.array([f[1] for f in sorted_fp])
-
-        if method.startswith("ma"):
-            w = int(method[2:])
-            kernel = np.ones(w) / w
-            probs = np.convolve(probs, kernel, mode='same')
-        elif method.startswith("median"):
-            k = int(method[6:])
-            probs = scipy_median_filter(probs, size=k)
-
-        result[vn] = [(frames[i], float(probs[i])) for i in range(len(frames))]
-    return result
-
-
-def postprocess_label(method):
-    """Čitljiv naziv za grafove."""
-    if method == "none":
-        return ""
-    if method.startswith("ma"):
-        return f" + Moving Average (w={method[2:]})"
-    if method.startswith("median"):
-        return f" + Median Filter (k={method[6:]})"
-    return f" + {method}"
-
+from utils import (
+    apply_postprocess, postprocess_label, compute_metrics,
+    find_best_threshold, threshold_sweep, compute_video_level_confusion,
+    POSTPROCESS_CHOICES
+)
 
 def run_inference(model, loader, device, seq_len):
-    """Pokreni inferenciju i grupiraj rezultate po videu s frame indeksima."""
+
     model.eval()
     use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
@@ -113,9 +60,8 @@ def run_inference(model, loader, device, seq_len):
 
     return video_probs
 
-
 def build_binary_labels(video_probs, all_metadata):
-    """Izgradi binarni GT (bez rampe) za svaki uzorak koristeći metadata."""
+
     all_probs = []
     all_labels = []
     all_video_names = []
@@ -130,7 +76,6 @@ def build_binary_labels(video_probs, all_metadata):
         preds = sorted(video_probs[vn], key=lambda x: x[0])
         for frame_idx, prob in preds:
             all_probs.append(prob)
-            # Binarni GT: 1 ako je frame u [anomaly_start, anomaly_end], inače 0
             if anomaly_start >= 0 and anomaly_end >= 0 and anomaly_start <= frame_idx <= anomaly_end:
                 all_labels.append(1.0)
             else:
@@ -139,71 +84,8 @@ def build_binary_labels(video_probs, all_metadata):
 
     return np.array(all_probs), np.array(all_labels), all_video_names
 
-
-# ========================================================================= #
-#  Metrike                                                                    #
-# ========================================================================= #
-
-def compute_metrics(probs, labels, threshold=0.5):
-    preds = (probs >= threshold).astype(float)
-    metrics = {
-        "n_samples": len(labels),
-        "n_positive": int(labels.sum()),
-        "n_negative": int((1 - labels).sum()),
-        "threshold": threshold,
-        "accuracy": float(accuracy_score(labels, preds)),
-        "precision": float(precision_score(labels, preds, zero_division=0)),
-        "recall": float(recall_score(labels, preds, zero_division=0)),
-        "f1": float(f1_score(labels, preds, zero_division=0)),
-    }
-    try:
-        metrics["auc_roc"] = float(roc_auc_score(labels, probs))
-    except ValueError:
-        metrics["auc_roc"] = 0.0
-    try:
-        metrics["average_precision"] = float(average_precision_score(labels, probs))
-    except ValueError:
-        metrics["average_precision"] = 0.0
-
-    cm = confusion_matrix(labels, preds, labels=[0, 1])
-    metrics["confusion_matrix"] = {
-        "TN": int(cm[0, 0]), "FP": int(cm[0, 1]),
-        "FN": int(cm[1, 0]), "TP": int(cm[1, 1]),
-    }
-    return metrics
-
-
-def find_best_threshold(probs, labels):
-    best_f1, best_thr = 0.0, 0.5
-    for thr in np.arange(0.1, 0.91, 0.01):
-        preds = (probs >= thr).astype(float)
-        f1 = f1_score(labels, preds, zero_division=0)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_thr = thr
-    return float(best_thr), float(best_f1)
-
-
-def threshold_sweep(probs, labels):
-    results = []
-    for thr in np.arange(0.1, 0.91, 0.05):
-        preds = (probs >= thr).astype(float)
-        results.append({
-            "threshold": round(float(thr), 2),
-            "precision": float(precision_score(labels, preds, zero_division=0)),
-            "recall": float(recall_score(labels, preds, zero_division=0)),
-            "f1": float(f1_score(labels, preds, zero_division=0)),
-            "accuracy": float(accuracy_score(labels, preds)),
-        })
-    return results
-
-
-# ========================================================================= #
-#  Delay analiza (referentna točka = anomaly_start)                          #
-# ========================================================================= #
-
 def analyze_delays_no_ramp(video_probs, all_metadata, threshold=0.5):
-    """Delay analiza s anomaly_start kao referentnom točkom."""
+
     delays = []
     missed_events = 0
     false_alarm_distances = []
@@ -220,12 +102,10 @@ def analyze_delays_no_ramp(video_probs, all_metadata, threshold=0.5):
 
         total_anomaly_videos += 1
 
-        # Referentna točka = anomaly_start (bez rampe)
         gt_ref = float(anomaly_start)
 
         preds = sorted(video_probs[vn], key=lambda x: x[0])
 
-        # Nađi sve 0→1 tranzicije
         model_onsets = []
         prev_pred = 0
         for frame_idx, prob in preds:
@@ -253,11 +133,6 @@ def analyze_delays_no_ramp(video_probs, all_metadata, threshold=0.5):
         "total_anomaly_videos": total_anomaly_videos,
     }
 
-
-# ========================================================================= #
-#  Grafovi                                                                    #
-# ========================================================================= #
-
 def plot_roc_curve(labels, probs, save_path, title_extra=""):
     fpr, tpr, _ = roc_curve(labels, probs)
     auc = roc_auc_score(labels, probs)
@@ -271,7 +146,6 @@ def plot_roc_curve(labels, probs, save_path, title_extra=""):
     ax.grid(True, alpha=0.3)
     ax.set_xlim([0, 1]); ax.set_ylim([0, 1])
     plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
-
 
 def plot_pr_curve(labels, probs, save_path, title_extra=""):
     precision, recall, _ = precision_recall_curve(labels, probs)
@@ -287,7 +161,6 @@ def plot_pr_curve(labels, probs, save_path, title_extra=""):
     ax.set_xlim([0, 1]); ax.set_ylim([0, 1])
     plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
 
-
 def plot_score_distribution(labels, probs, save_path, title_extra=""):
     pos_probs = probs[labels >= 0.5]
     neg_probs = probs[labels < 0.5]
@@ -298,7 +171,6 @@ def plot_score_distribution(labels, probs, save_path, title_extra=""):
     ax.set_title(f"Distribucija izlaznih ocjena{title_extra}")
     ax.legend(); ax.grid(True, alpha=0.3)
     plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
-
 
 def plot_confusion_matrix(cm_dict, save_path, threshold=0.5, title_extra=""):
     cm = np.array([[cm_dict["TN"], cm_dict["FP"]],
@@ -316,76 +188,6 @@ def plot_confusion_matrix(cm_dict, save_path, threshold=0.5, title_extra=""):
             ax.text(j, i, str(cm[i, j]), ha="center", va="center", color=color, fontsize=16)
     plt.colorbar(im); plt.tight_layout()
     plt.savefig(save_path, dpi=150); plt.close()
-
-
-def compute_video_level_confusion(video_probs, all_metadata, threshold=0.5,
-                                   tolerance_frames=10, before_frames=None, after_frames=None):
-    """
-    Video-level confusion matrix.
-    
-    Raspon oko anomaly_start:
-      - Ako before_frames i after_frames su None: koristi ±tolerance_frames (simetričan)
-      - Inače: onset mora biti u [anomaly_start - before_frames, anomaly_start + after_frames]
-    """
-    tp, fp, fn, tn = 0, 0, 0, 0
-    tp_videos, fp_videos, fn_videos = [], [], []
-
-    for vn in sorted(video_probs.keys()):
-        meta = all_metadata.get(vn)
-        if meta is None:
-            continue
-
-        anomaly_start = meta.get("anomaly_start", -1)
-        anomaly_end = meta.get("anomaly_end", -1)
-        has_anomaly = anomaly_start >= 0 and anomaly_end >= 0
-
-        # Nađi sve 0→1 onsets
-        preds = sorted(video_probs[vn], key=lambda x: x[0])
-        onsets = []
-        prev = 0
-        for frame_idx, prob in preds:
-            curr = 1 if prob >= threshold else 0
-            if prev == 0 and curr == 1:
-                onsets.append(frame_idx)
-            prev = curr
-
-        if has_anomaly:
-            if before_frames is not None and after_frames is not None:
-                lo = anomaly_start - before_frames
-                hi = anomaly_start + after_frames
-                detected = any(lo <= o <= hi for o in onsets)
-            else:
-                detected = any(abs(o - anomaly_start) <= tolerance_frames for o in onsets)
-            if detected:
-                tp += 1
-                tp_videos.append(vn)
-            else:
-                fn += 1
-                fn_videos.append(vn)
-        else:
-            if len(onsets) == 0:
-                tn += 1
-            else:
-                fp += 1
-                fp_videos.append(vn)
-
-    result = {
-        "TP": tp, "FP": fp, "FN": fn, "TN": tn,
-        "total": tp + fp + fn + tn,
-        "accuracy": (tp + tn) / max(tp + fp + fn + tn, 1),
-        "precision": tp / max(tp + fp, 1),
-        "recall": tp / max(tp + fn, 1),
-        "f1": 2 * tp / max(2 * tp + fp + fn, 1),
-        "tolerance_frames": tolerance_frames,
-        "tp_videos": tp_videos,
-        "fp_videos": fp_videos,
-        "fn_videos": fn_videos,
-    }
-    if before_frames is not None:
-        result["before_frames"] = before_frames
-        result["after_frames"] = after_frames
-    return result
-
 
 def plot_video_confusion_matrix(vcm, save_path, title=None):
     cm = np.array([[vcm["TN"], vcm["FP"]],
@@ -407,7 +209,6 @@ def plot_video_confusion_matrix(vcm, save_path, title=None):
     plt.colorbar(im); plt.tight_layout()
     plt.savefig(save_path, dpi=150); plt.close()
 
-
 def plot_delay_histogram(delays, save_path, title_suffix="", title_extra=""):
     min_d = int(np.floor(delays.min()))
     max_d = int(np.ceil(delays.max()))
@@ -422,7 +223,6 @@ def plot_delay_histogram(delays, save_path, title_suffix="", title_extra=""):
     ax.set_title(f"Distribucija kašnjenja (samo detekcije najbliže stvarnim oznakama){title_extra}")
     ax.legend(); plt.tight_layout()
     plt.savefig(save_path, dpi=150); plt.close()
-
 
 def plot_delay_histogram_all(delays, false_alarm_dists, save_path, title_extra=""):
     all_d = np.concatenate([delays, np.array(false_alarm_dists)]) if false_alarm_dists else delays
@@ -440,7 +240,6 @@ def plot_delay_histogram_all(delays, false_alarm_dists, save_path, title_extra="
     ax.legend(); plt.tight_layout()
     plt.savefig(save_path, dpi=150); plt.close()
 
-
 def plot_delay_cdf(delays, save_path, title_extra=""):
     sorted_d = np.sort(delays)
     cdf = np.arange(1, len(sorted_d) + 1) / len(sorted_d)
@@ -451,7 +250,6 @@ def plot_delay_cdf(delays, save_path, title_extra=""):
     ax.set_title(f"Kumulativna distribucija kašnjenja (ref. = početak anomalije){title_extra}")
     ax.grid(True, alpha=0.3); plt.tight_layout()
     plt.savefig(save_path, dpi=150); plt.close()
-
 
 def plot_cumulative_late(delays, save_path, title_extra=""):
     max_d = int(np.ceil(delays.max())) if delays.max() > 0 else 0
@@ -464,11 +262,6 @@ def plot_cumulative_late(delays, save_path, title_extra=""):
     ax.set_title(f"Kumulativno kašnjenje (ref. = početak anomalije){title_extra}")
     ax.set_ylim(0, 105); plt.tight_layout()
     plt.savefig(save_path, dpi=150); plt.close()
-
-
-# ========================================================================= #
-#  Main                                                                       #
-# ========================================================================= #
 
 def main():
     parser = argparse.ArgumentParser()
@@ -489,14 +282,12 @@ def main():
                         help="Override test split fajla (npr. ../dataset/dota_test_split.txt za DoTA-only evaluaciju)")
     args = parser.parse_args()
 
-    # --- Config ---
     ckpt_dir = os.path.dirname(args.checkpoint)
     ckpt_config = os.path.join(ckpt_dir, "source", "config.yaml")
     config_path = ckpt_config if os.path.exists(ckpt_config) else "config.yaml"
     with open(config_path, encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    # --- Runtime override configa za evaluaciju na drugom datasetu ---
     if args.frames_root is not None:
         config["frames_root"] = args.frames_root
     if args.metadata_dir is not None:
@@ -526,7 +317,6 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    # --- Model ---
     model = CNN_LSTM_BBox(
         hidden_dim=config.get("hidden_dim", 256),
         lstm_layers=config.get("lstm_layers", 1),
@@ -565,7 +355,6 @@ def main():
     if args.postprocess != "none":
         print(f"Post-processing: {args.postprocess}")
 
-    # --- DataLoader ---
     seq_len = config.get("seq_len", 24)
     config["batch_size"] = 32
     config["num_workers"] = 4
@@ -574,7 +363,6 @@ def main():
     config["pin_memory"] = True
     loader = create_test_dataloader(config, split=args.split)
 
-    # --- Inference ---
     cache_key_src = "|".join([
         str(args.split),
         str(config.get("frames_root", "")),
@@ -582,7 +370,7 @@ def main():
         str(config.get("yolo_detections_dir", "")),
         str(config.get("optical_flow_dir", "")) if config.get("use_optical_flow", False) else "flow_off",
         str(config.get("cnn_cache_dir", "")),
-        str(config.get("test_split_file", "")),  # različit hash za DoTA-only evaluaciju
+        str(config.get("test_split_file", "")),
     ])
     cache_hash = hashlib.md5(cache_key_src.encode("utf-8")).hexdigest()[:10]
     probs_cache = os.path.join(ckpt_dir, f"video_probs_{cache_hash}.pkl")
@@ -596,7 +384,6 @@ def main():
             pickle.dump(dict(video_probs), f)
         print(f"Predikcije spremljene: {probs_cache}")
 
-    # --- Metadata ---
     metadata_dir = config.get("metadata_dir", "../dataset")
     all_metadata = {}
     for fname in ["metadata_train.json", "metadata_val.json", "metadata_test.json"]:
@@ -605,19 +392,16 @@ def main():
             with open(p, encoding="utf-8") as f:
                 all_metadata.update(json.load(f))
 
-    # --- Post-processing ---
     pp_label = postprocess_label(args.postprocess)
     if args.postprocess != "none":
         print(f"\nPost-processing: {args.postprocess}{pp_label}")
         video_probs = apply_postprocess(video_probs, args.postprocess)
 
-    # --- Binarni GT (bez rampe) ---
     probs, labels, video_names = build_binary_labels(video_probs, all_metadata)
     print(f"\nUkupno uzoraka: {len(labels)}")
     print(f"Pozitivni (u anomaliji): {int(labels.sum())} ({labels.mean()*100:.1f}%)")
     print(f"Negativni: {int((1-labels).sum())} ({(1-labels).mean()*100:.1f}%)")
 
-    # --- Klasifikacijske metrike ---
     metrics_05 = compute_metrics(probs, labels, threshold=0.5)
     best_thr, best_f1 = find_best_threshold(probs, labels)
     metrics_best = compute_metrics(probs, labels, threshold=best_thr)
@@ -641,7 +425,6 @@ def main():
     print(f"  Recall:     {metrics_best['recall']:.4f}")
     print(f"  F1:         {metrics_best['f1']:.4f}")
 
-    # --- Video-level confusion matrices ---
     vcm_configs = [
         {"name": "±1.0s", "kwargs": {"tolerance_frames": 10}, "fname": "video_cm_pm1s"},
         {"name": "±2.0s", "kwargs": {"tolerance_frames": 20}, "fname": "video_cm_pm2s"},
@@ -660,7 +443,6 @@ def main():
         print(f"  Recall:     {vcm['recall']:.4f}")
         print(f"  F1:         {vcm['f1']:.4f}")
 
-    # --- Delay analiza (ref = anomaly_start) ---
     delay_res = analyze_delays_no_ramp(video_probs, all_metadata, threshold=args.threshold)
     delays = delay_res["delays"]
     missed = delay_res["missed_events"]
@@ -688,7 +470,6 @@ def main():
         print(f"  Točno:  {on_time} ({on_time/len(delays)*100:.1f}%)")
         print(f"  Kasno:  {late} ({late/len(delays)*100:.1f}%)")
 
-    # --- Spremi grafove ---
     if args.postprocess != "none":
         out_dir = os.path.join(ckpt_dir, f"no_ramp_{args.postprocess}")
     else:
@@ -727,7 +508,6 @@ def main():
         except Exception as e:
             print(f"  UPOZORENJE: Delay plot greška: {e}")
 
-    # --- JSON ---
     thr_sweep = threshold_sweep(probs, labels)
     results = {
         "mode": "no_ramp",
@@ -776,7 +556,6 @@ def main():
         json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"  JSON: {json_path}")
     print(f"\nGotovo!")
-
 
 if __name__ == "__main__":
     main()

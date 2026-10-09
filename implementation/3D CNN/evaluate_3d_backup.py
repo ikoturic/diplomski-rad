@@ -39,24 +39,11 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from model_3d import CNN3D_Danger
 from dataloader import create_test_dataloader
-
-
-# ========================================================================= #
-#  Post-processing                                                            #
-# ========================================================================= #
-
-POSTPROCESS_CHOICES = [
-    "none",
-    "ma3", "ma5", "ma7", "ma9",
-    "median3", "median5", "median7", "median11",
-    # Kauzalne (real-time)
-    "tma3", "tma5", "tma7", "tma9",
-    "ema01", "ema02", "ema03", "ema05",
-    "ema02_hyst_05_02",
-    "ema03_hyst_05_02",
-    "tma5_hyst_05_02",
-    "hyst_05_02", "hyst_06_03", "hyst_07_03",
-]
+from utils import (
+    POSTPROCESS_CHOICES, apply_postprocess, postprocess_label,
+    compute_metrics, find_best_threshold, threshold_sweep,
+    compute_video_level_confusion
+)
 
 
 def _trailing_ma(probs, window):
@@ -250,63 +237,6 @@ def build_binary_labels(video_probs, all_metadata):
 
 
 # ========================================================================= #
-#  Metrike                                                                    #
-# ========================================================================= #
-
-def compute_metrics(probs, labels, threshold=0.5):
-    preds = (probs >= threshold).astype(float)
-    m = {
-        "n_samples": len(labels),
-        "n_positive": int(labels.sum()),
-        "n_negative": int((1 - labels).sum()),
-        "threshold": threshold,
-        "accuracy": float(accuracy_score(labels, preds)),
-        "precision": float(precision_score(labels, preds, zero_division=0)),
-        "recall": float(recall_score(labels, preds, zero_division=0)),
-        "f1": float(f1_score(labels, preds, zero_division=0)),
-    }
-    try:
-        m["auc_roc"] = float(roc_auc_score(labels, probs))
-    except ValueError:
-        m["auc_roc"] = 0.0
-    try:
-        m["average_precision"] = float(average_precision_score(labels, probs))
-    except ValueError:
-        m["average_precision"] = 0.0
-    cm = confusion_matrix(labels, preds, labels=[0, 1])
-    m["confusion_matrix"] = {
-        "TN": int(cm[0, 0]), "FP": int(cm[0, 1]),
-        "FN": int(cm[1, 0]), "TP": int(cm[1, 1]),
-    }
-    return m
-
-
-def find_best_threshold(probs, labels):
-    best_f1, best_thr = 0.0, 0.5
-    for thr in np.arange(0.1, 0.91, 0.01):
-        preds = (probs >= thr).astype(float)
-        f1 = f1_score(labels, preds, zero_division=0)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_thr = thr
-    return float(best_thr), float(best_f1)
-
-
-def threshold_sweep(probs, labels):
-    results = []
-    for thr in np.arange(0.1, 0.91, 0.05):
-        preds = (probs >= thr).astype(float)
-        results.append({
-            "threshold": round(float(thr), 2),
-            "precision": float(precision_score(labels, preds, zero_division=0)),
-            "recall": float(recall_score(labels, preds, zero_division=0)),
-            "f1": float(f1_score(labels, preds, zero_division=0)),
-            "accuracy": float(accuracy_score(labels, preds)),
-        })
-    return results
-
-
-# ========================================================================= #
 #  Delay analiza (ref = anomaly_start)                                        #
 # ========================================================================= #
 
@@ -353,75 +283,6 @@ def analyze_delays_no_ramp(video_probs, all_metadata, threshold=0.5):
         "false_alarm_distances": false_alarm_distances,
         "total_anomaly_videos": total_anomaly_videos,
     }
-
-
-# ========================================================================= #
-#  Video-level confusion matrica                                              #
-# ========================================================================= #
-
-def compute_video_level_confusion(video_probs, all_metadata, threshold=0.5,
-                                   tolerance_frames=10, before_frames=None, after_frames=None):
-    """
-    Raspon oko anomaly_start:
-      - tolerance_frames (simetrično): onset u [a_start - tol, a_start + tol]
-      - before/after (asimetrično):     onset u [a_start - before, a_start + after]
-    """
-    tp, fp, fn, tn = 0, 0, 0, 0
-    tp_videos, fp_videos, fn_videos = [], [], []
-
-    for vn in sorted(video_probs.keys()):
-        meta = all_metadata.get(vn)
-        if meta is None:
-            continue
-        a_start = meta.get("anomaly_start", -1)
-        a_end = meta.get("anomaly_end", -1)
-        has_anomaly = a_start >= 0 and a_end >= 0
-
-        preds = sorted(video_probs[vn], key=lambda x: x[0])
-        onsets = []
-        prev = 0
-        for frame_idx, prob in preds:
-            curr = 1 if prob >= threshold else 0
-            if prev == 0 and curr == 1:
-                onsets.append(frame_idx)
-            prev = curr
-
-        if has_anomaly:
-            if before_frames is not None and after_frames is not None:
-                lo = a_start - before_frames
-                hi = a_start + after_frames
-                detected = any(lo <= o <= hi for o in onsets)
-            else:
-                detected = any(abs(o - a_start) <= tolerance_frames for o in onsets)
-            if detected:
-                tp += 1
-                tp_videos.append(vn)
-            else:
-                fn += 1
-                fn_videos.append(vn)
-        else:
-            if len(onsets) == 0:
-                tn += 1
-            else:
-                fp += 1
-                fp_videos.append(vn)
-
-    result = {
-        "TP": tp, "FP": fp, "FN": fn, "TN": tn,
-        "total": tp + fp + fn + tn,
-        "accuracy": (tp + tn) / max(tp + fp + fn + tn, 1),
-        "precision": tp / max(tp + fp, 1),
-        "recall": tp / max(tp + fn, 1),
-        "f1": 2 * tp / max(2 * tp + fp + fn, 1),
-        "tolerance_frames": tolerance_frames,
-        "tp_videos": tp_videos,
-        "fp_videos": fp_videos,
-        "fn_videos": fn_videos,
-    }
-    if before_frames is not None:
-        result["before_frames"] = before_frames
-        result["after_frames"] = after_frames
-    return result
 
 
 # ========================================================================= #

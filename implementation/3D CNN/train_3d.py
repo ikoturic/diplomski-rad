@@ -1,18 +1,3 @@
-"""
-Trening skripta za 3D CNN model – next-frame predviđanje opasnosti.
-
-Pokretanje:
-    cd "3D CNN"
-    python train_3d.py --config config_3d.yaml
-
-Razlike u odnosu na 2D CNN + LSTM pristup:
-    - 3D CNN (R(2+1)D-18) obrađuje cijeli clip odjednom
-    - Nema LSTM za globalne features (3D CNN modelira temporalne uzorke)
-    - Nema ROI Align (3D feature mape su spatiotemporalne)
-    - Objektni tok koristi samo numeričke bbox značajke + attention
-    - Manji batch size (3D CNN troši više VRAM-a)
-"""
-
 import os
 import sys
 import json
@@ -39,103 +24,11 @@ import matplotlib.pyplot as plt
 
 from torch.utils.data import Subset
 
-# Import iz parent direktorija
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from dataloader import create_dataloaders
 from model_3d import CNN3D_Danger, count_parameters, count_all_parameters
+from utils import EMA, mixup_batch, save_checkpoint, load_checkpoint, FocalBCEWithLogitsLoss
 
-
-# ========================================================================= #
-#  Focal Loss                                                                 #
-# ========================================================================= #
-
-class FocalBCEWithLogitsLoss(nn.Module):
-    """
-    Focal Loss za binarnu klasifikaciju (radi s logitima).
-    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
-    """
-
-    def __init__(self, gamma=2.0, alpha=0.75, label_smoothing=0.0):
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-        self.label_smoothing = label_smoothing
-
-    def forward(self, logits, targets):
-        if self.label_smoothing > 0:
-            targets = targets * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
-        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-        probs = torch.sigmoid(logits)
-        p_t = probs * targets + (1 - probs) * (1 - targets)
-        focal_weight = (1 - p_t) ** self.gamma
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
-        loss = alpha_t * focal_weight * bce
-        return loss.mean()
-
-
-# ========================================================================= #
-#  EMA (Exponential Moving Average)                                           #
-# ========================================================================= #
-
-class EMA:
-    def __init__(self, model, decay=0.999):
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        self._initialized = False
-
-    @torch.no_grad()
-    def update(self, model):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                if not self._initialized:
-                    self.shadow[name] = param.data.clone()
-                else:
-                    self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
-        self._initialized = True
-
-    def apply_shadow(self, model):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
-
-    def restore(self, model):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                param.data.copy_(self.backup[name])
-        self.backup = {}
-
-
-# ========================================================================= #
-#  Mixup za sekvence                                                          #
-# ========================================================================= #
-
-def mixup_batch(batch, alpha=0.2):
-    if alpha <= 0:
-        return batch
-    lam = torch.distributions.Beta(alpha, alpha).sample().item()
-    lam = max(lam, 1 - lam)
-    B = batch["frames"].size(0)
-    indices = torch.randperm(B)
-
-    mixed = {}
-    for key in ["frames", "bboxes", "bbox_features"]:
-        if key in batch:
-            mixed[key] = lam * batch[key] + (1 - lam) * batch[key][indices]
-    mixed["categories"] = batch["categories"]
-    mixed["obj_mask"] = batch["obj_mask"]
-    mixed["target"] = lam * batch["target"] + (1 - lam) * batch["target"][indices]
-    if "flow" in batch:
-        mixed["flow"] = lam * batch["flow"] + (1 - lam) * batch["flow"][indices]
-    if "per_frame_targets" in batch:
-        mixed["per_frame_targets"] = lam * batch["per_frame_targets"] + (1 - lam) * batch["per_frame_targets"][indices]
-    return mixed
-
-
-# ========================================================================= #
-#  Trening jedne epohe                                                       #
-# ========================================================================= #
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch,
                     accum_steps=1, mixup_alpha=0.0, amp_dtype=torch.float16,
@@ -151,8 +44,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch,
         if mixup_alpha > 0:
             batch = mixup_batch(batch, alpha=mixup_alpha)
 
-        # 3D model zahtijeva raw frames (ne CNN cache)
-        assert "frames" in batch, "3D CNN model zahtijeva raw frames! Ne koristite cnn_cache_dir."
+        assert "frames" in batch, "3D CNN model zahtijeva raw frames!"
         frames = batch["frames"].to(device, non_blocking=True)
         bbox_features = batch["bbox_features"].to(device, non_blocking=True)
         categories = batch["categories"].to(device, non_blocking=True)
@@ -180,7 +72,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch,
                 aux_targets = torch.stack(
                     [per_frame_t[:, i * seg:(i + 1) * seg].max(dim=1).values
                      for i in range(T_prime)], dim=1
-                )  # (B, T')
+                )
                 aux_loss = criterion(temporal_logits.reshape(-1), aux_targets.reshape(-1))
                 loss = (main_loss + temporal_aux_weight * aux_loss) / accum_steps
             else:
@@ -217,10 +109,6 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch,
     }
     return metrics
 
-
-# ========================================================================= #
-#  Validacija                                                                 #
-# ========================================================================= #
 
 @torch.inference_mode()
 def validate(model, loader, criterion, device, amp_dtype=torch.float16):
@@ -271,51 +159,15 @@ def validate(model, loader, criterion, device, amp_dtype=torch.float16):
     return metrics
 
 
-# ========================================================================= #
-#  Checkpoint save / load                                                     #
-# ========================================================================= #
-
-def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best_auc, history):
-    state_model = model._orig_mod if hasattr(model, '_orig_mod') else model
-    torch.save({
-        "epoch": epoch,
-        "model_state_dict": state_model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
-        "best_auc": best_auc,
-        "history": history,
-    }, path)
-
-
-def load_checkpoint(path, model, optimizer, scheduler, scaler, device):
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    scaler.load_state_dict(ckpt["scaler_state_dict"])
-    return ckpt["epoch"], ckpt.get("best_auc", 0.0), ckpt.get("history", [])
-
-
-# ========================================================================= #
-#  Main trening petlja                                                        #
-# ========================================================================= #
-
 def train(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nUređaj: {device}")
     if device.type == "cuda":
-        print(f"  GPU: {torch.cuda.get_device_name()}")
-        mem = torch.cuda.get_device_properties(0)
-        total_mem = getattr(mem, 'total_mem', getattr(mem, 'total_memory', 0))
-        print(f"  VRAM: {total_mem / 1e9:.1f} GB")
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision('high')
-        print(f"  cudnn.benchmark = True, TF32 = True")
 
-    # --- Checkpoint folder (auto-increment ili override) ---
     ckpt_base = "checkpoints_3d"
     if "_ckpt_dir_override" in config:
         ckpt_dir = config["_ckpt_dir_override"]
@@ -328,7 +180,6 @@ def train(config):
     os.makedirs(ckpt_dir, exist_ok=True)
     print(f"\nCheckpoint folder: {ckpt_dir}")
 
-    # --- Spremi snapshot izvornog koda i konfiguracije ---
     source_dir = os.path.join(ckpt_dir, "source")
     os.makedirs(source_dir, exist_ok=True)
     _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -336,19 +187,14 @@ def train(config):
         _src_path = os.path.join(_script_dir, _src_file)
         if os.path.isfile(_src_path):
             shutil.copy2(_src_path, os.path.join(source_dir, _src_file))
-    # Kopiraj i parent dataloader za potpuni snapshot
     _parent_dir = os.path.join(_script_dir, "..")
     for _src_file in ["dataloader.py"]:
         _src_path = os.path.join(_parent_dir, _src_file)
         if os.path.isfile(_src_path):
             shutil.copy2(_src_path, os.path.join(source_dir, _src_file))
-    print(f"  Izvorni kod spremljen: {source_dir}/")
 
-    # --- Data ---
     print("\nPriprema podataka...")
-    # 3D model NE koristi CNN cache – uvijek učitava raw frames
-    assert config.get("cnn_cache_dir") is None, \
-        "3D CNN model ne podržava CNN cache! Uklonite 'cnn_cache_dir' iz konfiguracije."
+    assert config.get("cnn_cache_dir") is None, "3D CNN model ne podržava CNN cache!"
     fold_train = config.pop("_fold_train_vids", None)
     fold_val   = config.pop("_fold_val_vids",   None)
     train_loader, val_loader, _ = create_dataloaders(
@@ -358,7 +204,6 @@ def train(config):
         print("GREŠKA: Prazan dataset!")
         return
 
-    # --- Model ---
     model = CNN3D_Danger(
         backbone_3d=config.get("backbone_3d", "r2plus1d_18"),
         hidden_dim=config.get("hidden_dim", 256),
@@ -387,36 +232,20 @@ def train(config):
 
     trainable = count_parameters(model)
     total = count_all_parameters(model)
-    print(f"\nModel: CNN3D_Danger (3D CNN backbone)")
-    print(f"  Backbone: {config.get('backbone_3d', 'r2plus1d_18')}")
-    print(f"  Trainable: {trainable:,}")
-    print(f"  Total:     {total:,}")
-    print(f"  Frozen:    {total - trainable:,}")
-    print(f"  Hidden dim: {config.get('hidden_dim', 256)}")
-    print(f"  Object branch: {config.get('use_object_branch', True)}")
-    print(f"  Object interaction: {config.get('use_object_interaction', False)}")
-    print(f"  Freeze 3D: {config.get('freeze_3d', False)}")
-    print(f"  Freeze early: {config.get('freeze_early', True)}")
-    print(f"  Grad checkpoint: {config.get('use_grad_checkpoint', True)}")
-    print(f"  Batch size: {config.get('batch_size', 16)} (effective: {config.get('batch_size', 16) * config.get('gradient_accumulation_steps', 1)})")
-    print(f"  Image size: {config.get('img_size', [112, 112])}")
-    print(f"  Temporal aux loss: {config.get('use_temporal_aux', False)} (weight={config.get('temporal_aux_weight', 0.3)})")
+    print(f"\nModel: {config.get('backbone_3d', 'r2plus1d_18')} - Trainable: {trainable:,} / Total: {total:,}")
+
     use_focal = config.get("use_focal_loss", True)
     if use_focal:
         gamma = config.get("focal_gamma", 2.0)
         alpha = config.get("focal_alpha", 0.75)
         ls = config.get("label_smoothing", 0.0)
         criterion = FocalBCEWithLogitsLoss(gamma=gamma, alpha=alpha, label_smoothing=ls)
-        print(f"\n  Loss: Focal BCE (gamma={gamma}, alpha={alpha}, label_smooth={ls})")
     else:
         criterion = nn.BCEWithLogitsLoss()
-        print(f"\n  Loss: Standard BCE")
 
-    # --- Optimizer ---
     base_lr = config.get("learning_rate", 1e-4)
     cnn_lr = base_lr * config.get("cnn_lr_factor", 0.1)
 
-    # Param grupe: head (base_lr), 3D backbone later layers (cnn_lr)
     head_params = []
     backbone_params = []
     for name, p in model.named_parameters():
@@ -432,11 +261,9 @@ def train(config):
     ]
     if backbone_params:
         param_groups.append({"params": backbone_params, "lr": cnn_lr})
-        print(f"  Backbone LR: {cnn_lr:.2e} ({config.get('cnn_lr_factor', 0.1)}x base)")
 
     optimizer = optim.AdamW(param_groups, weight_decay=config.get("weight_decay", 0.02))
 
-    # --- Scheduler ---
     warmup_epochs = config.get("warmup_epochs", 0)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
@@ -453,22 +280,15 @@ def train(config):
             schedulers=[warmup_scheduler, scheduler],
             milestones=[warmup_epochs],
         )
-        print(f"  Warmup: {warmup_epochs} epohe (linearan 1%→100% LR)")
-
-    # --- AMP ---
     use_bf16 = device.type == 'cuda' and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
     scaler = GradScaler(enabled=(device.type == 'cuda' and not use_bf16))
-    print(f"  AMP: {'BFloat16' if use_bf16 else 'Float16'}")
 
-    # --- Učitaj pre-trenirani backbone (TAU → DoTA transfer) ---
     pretrained_backbone = config.get("pretrained_backbone", None)
     if pretrained_backbone and os.path.isfile(pretrained_backbone):
-        print(f"\nUčitavam pre-trenirani backbone: {pretrained_backbone}")
         bb_ckpt = torch.load(pretrained_backbone, map_location=device, weights_only=False)
         bb_state = bb_ckpt.get("backbone_state_dict", bb_ckpt.get("model_state_dict", None))
         if bb_state is not None:
-            # Učitaj samo backbone parametre (stem, layer1-4) – preskoči ostalo
             model_state = raw_model.state_dict()
             backbone_keys = {k: v for k, v in bb_state.items()
                              if any(k.startswith(p) for p in ("stem.", "layer1.", "layer2.", "layer3.", "layer4."))}
@@ -476,27 +296,19 @@ def train(config):
             loaded = {k: v for k, v in backbone_keys.items() if k in model_state}
             model_state.update(loaded)
             raw_model.load_state_dict(model_state, strict=False)
-            print(f"  Učitano {len(loaded)} backbone parametara, preskočeno {len(missing)}")
-        else:
-            print("  [WARN] Backbone state_dict nije pronađen u checkpointu")
-    elif pretrained_backbone:
-        print(f"  [WARN] pretrained_backbone nije pronađen: {pretrained_backbone}")
+            print(f"  Učitano {len(loaded)} backbone parametara")
 
-    # --- Resume ---
     start_epoch = 1
     best_auc = 0.0
     history = []
 
     resume_path = config.get("resume", None)
     if resume_path and os.path.isfile(resume_path):
-        print(f"\nResume from: {resume_path}")
         start_epoch, best_auc, history = load_checkpoint(
             resume_path, raw_model, optimizer, scheduler, scaler, device
         )
         start_epoch += 1
-        print(f"  Continuing from epoch {start_epoch}, best AUC={best_auc:.4f}")
 
-    # --- Training loop ---
     num_epochs = config.get("num_epochs", 25)
     patience = config.get("early_stopping_patience", 7)
     epochs_no_improve = 0
@@ -507,23 +319,14 @@ def train(config):
     temporal_aux_weight = config.get("temporal_aux_weight", 0.3)
 
     print(f"\nTrening: {num_epochs} epoha, patience={patience}")
-    if accum_steps > 1:
-        print(f"  Gradient accumulation: {accum_steps} koraka")
-    if mixup_alpha > 0:
-        print(f"  Mixup: alpha={mixup_alpha}")
-    if use_temporal_aux:
-        print(f"  Temporal aux loss: weight={temporal_aux_weight}")
     print("-" * 60)
 
-    # --- EMA ---
     ema_decay = config.get("ema_decay", 0.0)
     ema_start = config.get("ema_start_epoch", 1)
     ema = None
     if ema_decay > 0:
         ema = EMA(raw_model, decay=ema_decay)
-        print(f"  EMA: decay={ema_decay}, start epoch {ema_start}")
 
-    # --- SWA ---
     swa_start = config.get("swa_start_epoch", 0)
     swa_lr = config.get("swa_lr", 5e-5)
     swa_model = None
@@ -532,13 +335,11 @@ def train(config):
     if swa_start > 0:
         swa_model = AveragedModel(raw_model)
         swa_scheduler = SWALR(optimizer, swa_lr=swa_lr)
-        print(f"  SWA: start epoch {swa_start}, lr={swa_lr:.2e}")
 
     for epoch in range(start_epoch, num_epochs + 1):
         t0 = time.time()
         torch.cuda.empty_cache()
 
-        # Koristimo SWA scheduler od swa_start_epoch
         _in_swa_phase = swa_model is not None and epoch >= swa_start
 
         train_metrics = train_one_epoch(
@@ -563,7 +364,6 @@ def train(config):
         if ema is not None and epoch >= ema_start:
             ema.restore(raw_model)
 
-        # Scheduler: SWA scheduler u SWA fazi, inače cosine
         if _in_swa_phase:
             swa_model.update_parameters(raw_model)
             swa_scheduler.step()
@@ -585,13 +385,9 @@ def train(config):
         history.append(entry)
 
         print(f"\nEpoha {epoch}/{num_epochs}  ({elapsed:.0f}s)  lr={lr:.2e}")
-        print(f"  Train - loss: {train_metrics['loss']:.4f}  "
-              f"acc: {train_metrics['accuracy']:.4f}  F1: {train_metrics['f1']:.4f}")
-        print(f"  Val   - loss: {val_metrics['loss']:.4f}  "
-              f"acc: {val_metrics['accuracy']:.4f}  F1: {val_metrics['f1']:.4f}  "
-              f"AUC: {val_metrics['auc']:.4f}")
+        print(f"  Train - loss: {train_metrics['loss']:.4f}  acc: {train_metrics['accuracy']:.4f}  F1: {train_metrics['f1']:.4f}")
+        print(f"  Val   - loss: {val_metrics['loss']:.4f}  acc: {val_metrics['accuracy']:.4f}  F1: {val_metrics['f1']:.4f}  AUC: {val_metrics['auc']:.4f}")
 
-        # Best model (regular / EMA)
         if val_metrics["auc"] > best_auc:
             best_auc = val_metrics["auc"]
             if ema is not None and epoch >= ema_start:
@@ -620,7 +416,6 @@ def train(config):
             print(f"\nEarly stopping nakon {patience} epoha bez poboljšanja.")
             break
 
-    # Save final
     if ema is not None and ema._initialized:
         ema.apply_shadow(raw_model)
     save_checkpoint(
@@ -629,19 +424,13 @@ def train(config):
     )
     if ema is not None and ema._initialized:
         ema.restore(raw_model)
-
-    # --- SWA finalizacija ---
     if swa_model is not None and swa_model.n_averaged > 0:
-        print(f"\nSWA finalizacija ({swa_model.n_averaged} modela averaged)...")
-        print("  Ažuriranje BatchNorm statistika na train setu...")
-        # torch.optim.swa_utils.update_bn ne radi za multi-input modele –
-        # ručno prolazimo train loader i zovemo model s punim batchom
         swa_model.train()
         for m in swa_model.modules():
             if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
                 m.reset_running_stats()
                 m.num_batches_tracked.zero_()
-                m.momentum = None  # kumulativni moving average
+                m.momentum = None
 
         with torch.no_grad():
             for batch in tqdm(train_loader, desc="  SWA BN update"):
@@ -654,7 +443,6 @@ def train(config):
                           categories=categories, obj_mask=obj_mask, flow=flow)
 
         swa_model.eval()
-        print("  Validacija SWA modela...")
         swa_val = validate(swa_model, val_loader, criterion, device, amp_dtype=amp_dtype)
         best_swa_auc = swa_val["auc"]
         print(f"  SWA AUC: {best_swa_auc:.4f}  (regular best: {best_auc:.4f})")
@@ -670,22 +458,17 @@ def train(config):
                  "swa_auc": best_swa_auc},
                 os.path.join(ckpt_dir, "best_model_swa.pth"),
             )
-            print(f"  >>> SWA bolji od best_model! Spremljeno: best_model_swa.pth")
-
-    # --- Spremi samo backbone (za transfer na DoTA) ---
+            print(f"  >>> SWA bolji od best_model!")
     if config.get("save_backbone_only", False):
         backbone_path = os.path.join(ckpt_dir, "tau_pretrain_backbone.pt")
         state_model = raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model
         backbone_state = {k: v for k, v in state_model.state_dict().items()
                           if any(k.startswith(p) for p in ("stem.", "layer1.", "layer2.", "layer3.", "layer4."))}
         torch.save({"backbone_state_dict": backbone_state, "best_auc": best_auc}, backbone_path)
-        print(f"  Backbone checkpoint: {backbone_path}")
-        print(f"  Dodaj u config_3d.yaml:  pretrained_backbone: \"{backbone_path}\"")
 
     with open(os.path.join(ckpt_dir, "training_history.json"), "w") as f:
         json.dump(history, f, indent=2)
 
-    # --- CV summary (ažurira se po svakom foldu) ---
     parent_dir = os.path.dirname(ckpt_dir)
     if os.path.basename(ckpt_dir).startswith("fold"):
         fold_id = os.path.basename(ckpt_dir)
@@ -702,22 +485,12 @@ def train(config):
             cv_summary["std_auc"]  = float((sum((a - cv_summary["mean_auc"])**2 for a in aucs) / len(aucs)) ** 0.5)
         with open(cv_summary_path, "w") as f:
             json.dump(cv_summary, f, indent=2)
-        print(f"\n  CV summary: {cv_summary_path}")
-        if "mean_auc" in cv_summary:
-            print(f"  CV mean AUC: {cv_summary['mean_auc']:.4f} ± {cv_summary['std_auc']:.4f}")
 
-    print(f"\nTrening završen!")
-    print(f"  Best regular AUC: {best_auc:.4f}")
+    print(f"\nTrening završen! Best AUC: {best_auc:.4f}")
     if swa_model is not None and swa_model.n_averaged > 0:
-        print(f"  Best SWA AUC:     {best_swa_auc:.4f}")
-    print(f"  Checkpointi: {ckpt_dir}")
-
+        print(f"Best SWA AUC: {best_swa_auc:.4f}")
     plot_training_curves(history, ckpt_dir)
 
-
-# ========================================================================= #
-#  Grafovi                                                                    #
-# ========================================================================= #
 
 def plot_training_curves(history, save_dir):
     epochs = [e["epoch"] for e in history]
@@ -751,24 +524,15 @@ def plot_training_curves(history, save_dir):
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "training_curves.png"), dpi=150)
     plt.close()
-    print(f"  Grafovi: {save_dir}/training_curves.png")
 
-
-# ========================================================================= #
-#  CLI                                                                        #
-# ========================================================================= #
 
 def main():
-    parser = argparse.ArgumentParser(description="Train 3D CNN danger prediction model")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config_3d.yaml")
     parser.add_argument("--resume", default=None)
-    parser.add_argument("--fold",    type=int, default=-1,
-                        help="K-fold CV: indeks folda (0-based). -1 = normalan trening.")
-    parser.add_argument("--n_folds", type=int, default=5,
-                        help="Broj foldova za CV (default=5).")
-    parser.add_argument("--version", type=int, default=None,
-                        help="Fiksna verzija checkpointa (npr. 21 za v21). "
-                             "Za CV: svi foldovi dijele isti vN direktorij.")
+    parser.add_argument("--fold",    type=int, default=-1)
+    parser.add_argument("--n_folds", type=int, default=5)
+    parser.add_argument("--version", type=int, default=None)
     args = parser.parse_args()
 
     with open(args.config, encoding="utf-8") as f:
@@ -776,7 +540,6 @@ def main():
     if args.resume:
         config["resume"] = args.resume
 
-    # --- Odredi checkpoint verziju ---
     ckpt_base = "checkpoints_3d"
     if args.version is not None:
         version = args.version
@@ -787,17 +550,14 @@ def main():
     config["_version"] = version
 
     if args.fold < 0:
-        # Normalan trening – checkpoint dir je checkpoints_3d/vN
         config["_ckpt_dir_override"] = os.path.join(ckpt_base, f"v{version}")
         train(config)
     else:
-        # K-fold CV
         fold      = args.fold
         n_folds   = args.n_folds
         seed      = config.get("seed", 42)
         meta_dir  = config["metadata_dir"]
 
-        # Učitaj sve train klipove
         split_path = os.path.join(
             os.path.dirname(os.path.abspath(args.config)),
             meta_dir, "train_split.txt",
@@ -805,7 +565,6 @@ def main():
         with open(split_path, encoding="utf-8") as f:
             all_clips = [l.strip() for l in f if l.strip()]
 
-        # Deterministički shuffle pa k-fold split
         import numpy as np
         rng = np.random.default_rng(seed)
         indices = rng.permutation(len(all_clips))
@@ -815,8 +574,7 @@ def main():
         fold_val   = [all_clips[i] for i in indices if i in val_idx]
 
         print(f"\n{'='*60}")
-        print(f"K-FOLD CV  fold={fold}/{n_folds}  "
-              f"train={len(fold_train)}  val={len(fold_val)}")
+        print(f"K-FOLD CV  fold={fold}/{n_folds}  train={len(fold_train)}  val={len(fold_val)}")
         print(f"{'='*60}")
 
         config["_ckpt_dir_override"] = os.path.join(ckpt_base, f"v{version}", f"fold{fold}")

@@ -10,8 +10,9 @@ Nova strategija:
     - Bounding boxovi objekata (za ROI Align)
     - Numeričke značajke bbox-ova (pozicija, veličina, brzina, kategorija)
 
-    Bounding box značajke po objektu (14 dimenzija):
-    [cx, cy, w, h, area, aspect_ratio, dx, dy, dw, dh, conf, approach_rate, expansion_rate, ttc]
+    Bounding box značajke po objektu (17 dimenzija):
+    [cx, cy, w, h, area, aspect_ratio, dx, dy, dw, dh, conf, approach_rate, expansion_rate, ttc,
+     flow_mag, flow_angle, flow_std]
     - cx, cy:   normalizirana pozicija centra [0, 1]
     - w, h:     normalizirana veličina [0, 1]
     - area:     normalizirana površina bbox-a
@@ -22,6 +23,7 @@ Nova strategija:
     - approach_rate: brzina približavanja centru slike (negativno = približava se)
     - expansion_rate: relativna brzina rasta bbox-a (dw/w + dh/h)
     - ttc:      Time-to-Collision proxy = area / max(expansion_rate, eps)
+    - flow_mag, flow_angle, flow_std: Optical flow statistike unutar bbox-a
 
     Kategorije objekata: car, truck, bus, person, rider, bike, motor
 """
@@ -33,6 +35,7 @@ import json
 import random
 from functools import lru_cache
 from collections import OrderedDict
+from typing import Dict, List, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -42,41 +45,36 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 
+# Import utility modula iz utils paketa
+from utils import (
+    CATEGORY_MAP, NUM_CATEGORIES, IMAGENET_MEAN, IMAGENET_STD,
+    BBOX_FEATURE_DIM, FRAME_CACHE_MAX_SIZE, CNN_CACHE_MAX_SIZE,
+    INV_255, extract_bbox_features, apply_horizontal_flip_to_bbox,
+    AugmentationParams, apply_temporal_jitter, apply_color_jitter,
+    normalize_image, create_random_erasing_transform,
+    apply_horizontal_flip_to_flow, sample_temporal_mask_indices,
+    process_flow_sequence, extract_per_object_flow_patches, add_flow_features_to_bbox
+)
 
-# ── LRU keš za frame/flow čitanje (stride=1 → 23/24 frameova dijeljeno) ── #
+
+# ── LRU keš za frame čitanje (stride=1 → 23/24 frameova dijeljeno) ── #
 @lru_cache(maxsize=2048)
-def _cached_imread(path):
+def _cached_imread(path: str) -> Optional[np.ndarray]:
     """Učitaj sliku s diska i konvertiraj u RGB (keširano)."""
     img = cv2.imread(path)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else img
 
-@lru_cache(maxsize=2048)
-def _cached_load_flow(path):
-    return np.load(path).astype(np.float32)
 
+# Konstante za numpy normalizaciju (izbjegava re-kreaciju u __getitem__)
+_NORM_MEAN = np.array(IMAGENET_MEAN, dtype=np.float32).reshape(3, 1, 1)
+_NORM_STD = np.array(IMAGENET_STD, dtype=np.float32).reshape(3, 1, 1)
 
-# ── Konstante za brzu normalizaciju (izbjegava re-kreaciju u __getitem__) ── #
-_NORM_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
-_NORM_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
-_INV_255 = np.float32(1.0 / 255.0)
-_FRAME_CACHE_MAX = 5000
 
 # LRU keš za CNN cache fajlove (per-video .pt)
-@lru_cache(maxsize=200)
-def _cached_load_cnn_cache(path):
+@lru_cache(maxsize=CNN_CACHE_MAX_SIZE)
+def _cached_load_cnn_cache(path: str) -> Dict:
     """Učitaj pre-extracted CNN features za jedan video (keširano)."""
     return torch.load(path, map_location="cpu", weights_only=True)
-
-
-CATEGORY_MAP = {
-    "car": 1,
-    "truck": 2,
-    "bus": 3,
-    "person": 4,
-    "rider": 5,
-    "bike": 6,
-    "motor": 7,
-}
 
 
 class DoTANextFrameDataset(Dataset):

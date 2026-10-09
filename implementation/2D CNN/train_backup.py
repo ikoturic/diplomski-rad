@@ -10,6 +10,8 @@ Značajke:
     - AUC-based best model selection
     - Automatic checkpoint versioning
     - Mixed precision training (AMP)
+    - EMA (Exponential Moving Average)
+    - SWA (Stochastic Weight Averaging)
 """
 
 import os
@@ -20,6 +22,7 @@ import random
 import shutil
 import argparse
 from datetime import datetime
+from typing import Dict, Any
 
 import yaml
 import torch
@@ -28,6 +31,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
 from torch.optim.swa_utils import AveragedModel, SWALR
+from torch.utils.data import Subset
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
 )
@@ -36,133 +40,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from torch.utils.data import Subset
-
 from model import CNN_LSTM_BBox, count_parameters, count_all_parameters
 from dataloader import create_dataloaders
-
-
-# ========================================================================= #
-#  EMA (Exponential Moving Average)                                           #
-# ========================================================================= #
-
-class EMA:
-    """
-    Exponential Moving Average za model parametre.
-    Gladi težine svakog batcha: ema_param = decay * ema_param + (1 - decay) * param
-    Shadow se inicijalizira lazy — tek pri prvom update() pozivu.
-    """
-
-    def __init__(self, model, decay=0.999):
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        self._initialized = False
-        self._param_names = [
-            name for name, p in model.named_parameters() if p.requires_grad
-        ]
-
-    @torch.no_grad()
-    def update(self, model):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                if not self._initialized:
-                    # Lazy init: kopiraj trenutne (trenirane) težine kao početni shadow
-                    self.shadow[name] = param.data.clone()
-                else:
-                    self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
-        self._initialized = True
-
-    def apply_shadow(self, model):
-        """Zamijeni model parametre s EMA vrijednostima (za evaluaciju)."""
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
-
-    def restore(self, model):
-        """Vrati originalne parametre nakon evaluacije."""
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                param.data.copy_(self.backup[name])
-        self.backup = {}
-
-
-# ========================================================================= #
-#  Mixup za sekvence                                                          #
-# ========================================================================= #
-
-def mixup_batch(batch, alpha=0.2):
-    """
-    Mixup augmentacija za sekvencijalne podatke.
-    Miješa dva nasumična uzorka iz iste batch-a s težinom lambda.
-    """
-    if alpha <= 0:
-        return batch
-
-    lam = torch.distributions.Beta(alpha, alpha).sample().item()
-    lam = max(lam, 1 - lam)  # Osiguraj da je lam >= 0.5
-
-    B = batch["frames"].size(0) if "frames" in batch else batch["feat_maps"].size(0)
-    indices = torch.randperm(B)
-
-    mixed = {}
-    for key in ["bboxes", "bbox_features"]:
-        mixed[key] = lam * batch[key] + (1 - lam) * batch[key][indices]
-    if "frames" in batch:
-        mixed["frames"] = lam * batch["frames"] + (1 - lam) * batch["frames"][indices]
-    if "feat_maps" in batch:
-        mixed["feat_maps"] = lam * batch["feat_maps"] + (1 - lam) * batch["feat_maps"][indices]
-        mixed["global_feats"] = lam * batch["global_feats"] + (1 - lam) * batch["global_feats"][indices]
-    # Kategorije i maske: uzmi primarni uzorak (ne može se interpolirati)
-    mixed["categories"] = batch["categories"]
-    mixed["obj_mask"] = batch["obj_mask"]
-    # Target: interpoliraj
-    mixed["target"] = lam * batch["target"] + (1 - lam) * batch["target"][indices]
-    # Flow: interpoliraj ako postoji
-    if "flow" in batch:
-        mixed["flow"] = lam * batch["flow"] + (1 - lam) * batch["flow"][indices]
-    # Per-frame targets: interpoliraj ako postoji (multi-timestep loss)
-    if "per_frame_targets" in batch:
-        mixed["per_frame_targets"] = lam * batch["per_frame_targets"] + (1 - lam) * batch["per_frame_targets"][indices]
-
-    return mixed
-
-
-# ========================================================================= #
-#  Focal Loss                                                                 #
-# ========================================================================= #
-
-class FocalBCEWithLogitsLoss(nn.Module):
-    """
-    Focal Loss za binarnu klasifikaciju (radi s logitima).
-
-    Smanjuje doprinos "laganih" primjera (normalna vožnja) i pojačava
-    doprinos "teških" primjera (tranzicija normalno → opasno).
-
-    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
-
-    Label smoothing: targets 0→ε, 1→1-ε  (sprječava overconfidence)
-    """
-
-    def __init__(self, gamma=2.0, alpha=0.75, label_smoothing=0.0):
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-        self.label_smoothing = label_smoothing
-
-    def forward(self, logits, targets):
-        # Label smoothing: 0 → ε, 1 → 1-ε
-        if self.label_smoothing > 0:
-            targets = targets * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
-
-        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-        probs = torch.sigmoid(logits)
-        p_t = probs * targets + (1 - probs) * (1 - targets)
-        focal_weight = (1 - p_t) ** self.gamma
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
-        loss = alpha_t * focal_weight * bce
-        return loss.mean()
+from utils import EMA, mixup_batch, save_checkpoint, load_checkpoint, FocalBCEWithLogitsLoss
 
 
 # ========================================================================= #
@@ -299,33 +179,6 @@ def validate(model, loader, criterion, device, amp_dtype=torch.float16):
         metrics["auc"] = 0.0
 
     return metrics
-
-
-# ========================================================================= #
-#  Checkpoint save / load                                                     #
-# ========================================================================= #
-
-def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best_auc, history):
-    # Ako je model kompajliran s torch.compile, spremi originalni model
-    state_model = model._orig_mod if hasattr(model, '_orig_mod') else model
-    torch.save({
-        "epoch": epoch,
-        "model_state_dict": state_model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
-        "best_auc": best_auc,
-        "history": history,
-    }, path)
-
-
-def load_checkpoint(path, model, optimizer, scheduler, scaler, device):
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    scaler.load_state_dict(ckpt["scaler_state_dict"])
-    return ckpt["epoch"], ckpt.get("best_auc", 0.0), ckpt.get("history", [])
 
 
 # ========================================================================= #

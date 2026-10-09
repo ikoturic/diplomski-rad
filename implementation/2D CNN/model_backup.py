@@ -8,7 +8,7 @@ Arhitektura:
     Dva informacijska toka:
 
     1. GLOBALNI tok (scene-level):
-       - ResNet18 izvlači globalne vizualne značajke svake scene (512-dim)
+       - ResNet18/50 izvlači globalne vizualne značajke svake scene (512-dim)
        - Motion signal: razlika značajki uzastopnih frameova (128-dim)
 
     2. OBJEKTNI tok (object-level):
@@ -18,13 +18,14 @@ Arhitektura:
 
     3. TEMPORALNI tok:
        - LSTM s naučenim h_0: procesira 24 timestep-ova
-       - Temporal Attention: causal attention - povezuje ključne ranijie frameove
+       - Temporal Attention: causal attention - povezuje ključne ranije frameove
 
     4. Next-frame Classifier:
        - Iz zadnjeg LSTM stanja → danger logit za frame 25
 """
 
 import math
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -33,18 +34,7 @@ import torchvision.models as models
 from torchvision.ops import roi_align
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-
-# Kategorije objekata u DoTA anotacijama
-CATEGORY_MAP = {
-    "car": 1,
-    "truck": 2,
-    "bus": 3,
-    "person": 4,
-    "rider": 5,
-    "bike": 6,
-    "motor": 7,
-}
-NUM_CATEGORIES = len(CATEGORY_MAP)  # 7
+from utils import NUM_CATEGORIES
 
 
 # ========================================================================= #
