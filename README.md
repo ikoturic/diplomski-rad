@@ -1,4 +1,4 @@
-# Traffic Hazard Detection from Dashcam Videos
+# Automatic Detection of Hazardous Traffic Situations in Video using Deep Learning
 
 This repository contains the research code, experiment outputs, and supporting material for a master’s thesis focused on the automatic detection and anticipation of dangerous traffic situations from dashcam video.
 
@@ -70,15 +70,9 @@ The better-performing configuration in the thesis is the 3D model, which achieve
 
 The repository contains evaluation and training plots that are useful for the thesis presentation and documentation.
 
-![3D CNN ROC curve](implementation/3D%20CNN/checkpoints_3d/v18/roc_curve_3d.png)
+![3D CNN ROC curve](implementation/3D%20CNN/checkpoints_3d/v24/evaluacija_DoTA/roc_curve.png)
 
-![3D CNN training curves](implementation/3D%20CNN/checkpoints_3d/v18/training_curves.png)
-
-## Important note about the app
-
-This repository does not contain a finished Streamlit application that is ready for end-user deployment. The project code here is primarily the research implementation and experiment pipeline described in the thesis, not a packaged product UI.
-
-If the thesis PDF contains the prototype screenshots and interface examples, those should be used for presentation and documentation purposes, while the actual research code remains in the training and evaluation scripts.
+![3D CNN training curves](implementation/3D%20CNN/checkpoints_3d/v24/training_curves.png)
 
 ## Getting started
 
@@ -91,14 +85,11 @@ Typical workflow:
 3. Configure the YAML or script paths to match the local environment.
 4. Run the training or evaluation command for the selected model.
 
-## Limitations
-
-This repository is a research implementation rather than a fully standalone application. It includes the code, checkpoints, and evaluation artifacts used during the thesis project, but it does not fully package the data, trained weights, preprocessing pipeline, and deployment runtime required for a complete end-user demo.
 
 ## Thesis information
 
 - Original title: Sustav za automatsku detekciju opasnih prometnih situacija iz videozapisa pomoću dubokog učenja
-- English title: A System for Automatic Detection of Dangerous Traffic Situations from Videos Using Deep Learning
+- English title: Automatic detection of hazardous traffic situations in video using deep learning
 - Project type: Master’s thesis in computer engineering / software engineering
 
 ## Related literature
